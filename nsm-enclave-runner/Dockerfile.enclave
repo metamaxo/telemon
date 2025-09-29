@@ -1,0 +1,50 @@
+
+# =========================================================
+# Stage 1: Build (Amazon Linux 2023 + rustup)
+# =========================================================
+FROM amazonlinux:2023 AS builder
+
+# Toolchain for Rust (no OpenSSL headers needed; we use rustls)
+RUN dnf install -y --setopt=install_weak_deps=False \
+      git gcc gcc-c++ make pkgconf findutils \
+  && dnf clean all && rm -rf /var/cache/dnf
+
+# Install Rust (minimal profile)
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:$PATH
+
+# Build standalone crate
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked
+
+# Normalize output name for the runtime image
+RUN set -eux; \
+    mkdir -p /out; \
+    cp target/release/runner /out/enclave-runner; \
+    (command -v strip >/dev/null && strip /out/enclave-runner) || true
+
+# =========================================================
+# Stage 2: Runtime (minimal Amazon Linux 2023)
+# =========================================================
+FROM amazonlinux:2023 AS runtime
+
+# Minimal runtime: glibc + CA (handy if outbound TLS ever happens), tzdata for logs
+RUN dnf install -y --setopt=install_weak_deps=False \
+      ca-certificates tzdata shadow-utils \
+  && update-ca-trust \
+  && dnf clean all && rm -rf /var/cache/dnf
+
+# Runtime runs as root because binding AF_VSOCK sockets requires elevated privileges
+# inside the Nitro enclave microVM.
+WORKDIR /app
+
+# ---- Minimal env for your slim Config ----
+# Only the port portion of RUNNER_PUBLIC_ADDR matters for VSOCK (CID is provided by the kernel).
+ENV RUNNER_LOG_LEVEL=debug \
+    RUNNER_PUBLIC_ADDR=127.0.0.1:8443
+
+# Binary
+COPY --from=builder /out/enclave-runner /app/enclave-runner
+
+ENTRYPOINT ["/app/enclave-runner"]
