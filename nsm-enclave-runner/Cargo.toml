@@ -19,7 +19,8 @@ tokio-util = "0.7"       # CancellationToken
 axum = "0.7"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-tower-http = { version = "0.5", features = ["trace", "timeout"] }  # (no compression)
+tower-http = { version = "0.5", features = ["trace", "timeout", "map-request-body"] }  # (no compression)
+tower = "0.5"
 
 # VSOCK + TLS
 tokio-vsock = "0.5"
@@ -29,6 +30,7 @@ tokio-rustls = "0.26"
 # self-signed cert + SPKI extraction
 rcgen = "0.12"
 x509-parser = "0.16"
+time = { version = "0.3", features = ["std"] }
 
 # serde + json + helpers
 serde = { version = "1", features = ["derive"] }
@@ -37,6 +39,9 @@ base64 = "0.22"
 hex = "0.4"
 sha2 = "0.10"
 zeroize = "1"
+rand = "0.8"
+http-body-util = "0.1"
+thiserror = "1"
 
 aws-nitro-enclaves-nsm-api =  "0.4"
 

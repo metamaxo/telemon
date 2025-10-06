@@ -1,13 +1,16 @@
-use crate::state::{AttestationFields, AttestationResponse, PublicState};
+use crate::state::{attestation_response_from_nsm, RaTlsMaterial};
+use axum::extract::Extension;
 use axum::http::StatusCode;
-use axum::{extract::State, Json};
+use axum::Json;
 use base64::engine::general_purpose;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::signal;
 use tracing::{debug, warn};
+
+const MAX_NONCE_LEN: usize = 1024;
 
 /// Liveness probe endpoint.
 pub async fn ready() -> &'static str {
@@ -21,7 +24,7 @@ pub struct Health {
 }
 
 /// Readiness/health-check endpoint used by the parent instance.
-pub async fn health(State(_state): State<PublicState>) -> (StatusCode, Json<Health>) {
+pub async fn health() -> (StatusCode, Json<Health>) {
     (StatusCode::OK, Json(Health { status: "ok" }))
 }
 
@@ -32,82 +35,76 @@ pub struct AttestationRequest {
     pub nonce_b64: String,
 }
 
+fn resolve_snapshot(ext: Option<Extension<Arc<RaTlsMaterial>>>) -> Option<Arc<RaTlsMaterial>> {
+    ext.map(|Extension(snapshot)| snapshot)
+}
+
+enum NonceError {
+    InvalidLength(usize),
+    InvalidBase64(base64::DecodeError),
+}
+
+impl NonceError {
+    fn into_response(self) -> (StatusCode, Json<serde_json::Value>) {
+        match self {
+            NonceError::InvalidLength(len) => {
+                warn!(len, "invalid nonce length");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_nonce_length" })),
+                )
+            }
+            NonceError::InvalidBase64(error) => {
+                warn!(error=?error, "bad nonce base64");
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "invalid_nonce_base64" })),
+                )
+            }
+        }
+    }
+}
+
+fn decode_nonce(nonce_b64: &str) -> Result<Vec<u8>, NonceError> {
+    let decoded = general_purpose::STANDARD
+        .decode(nonce_b64.as_bytes())
+        .map_err(NonceError::InvalidBase64)?;
+    if decoded.is_empty() || decoded.len() > MAX_NONCE_LEN {
+        Err(NonceError::InvalidLength(decoded.len()))
+    } else {
+        Ok(decoded)
+    }
+}
+
 /// Attestation-on-demand:
 /// Accepts nonce -> calls NSM with { public_key = SPKI, nonce } -> returns COSE + metadata + TLS cert.
 pub async fn attestation_handler(
-    State(state): State<PublicState>,
+    maybe_snapshot: Option<Extension<Arc<RaTlsMaterial>>>,
     Json(req): Json<AttestationRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let b64 = |bytes: &[u8]| general_purpose::STANDARD.encode(bytes);
-
     // Decode + sanity-check nonce
-    let nonce = match general_purpose::STANDARD.decode(req.nonce_b64.as_bytes()) {
-        Ok(n) if !n.is_empty() && n.len() <= 1024 => n,
-        Ok(n) => {
-            warn!(len = n.len(), "invalid nonce length");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_nonce_length" })),
-            );
-        }
-        Err(e) => {
-            warn!(error=?e, "bad nonce base64");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_nonce_base64" })),
-            );
-        }
+    let nonce = match decode_nonce(&req.nonce_b64) {
+        Ok(bytes) => bytes,
+        Err(err) => return err.into_response(),
+    };
+
+    let Some(snapshot) = resolve_snapshot(maybe_snapshot) else {
+        warn!("RA-TLS snapshot missing from request context");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "ratls_context_unavailable" })),
+        );
     };
 
     // Call NSM: build fresh COSE_Sign1 attestation bound to our SPKI + the nonce
-    match crate::attest::build_nsm_attestation(&state.spki_der, &nonce).await {
+    match crate::attest::build_nsm_attestation(&snapshot.spki_der, &nonce).await {
         Ok(nsm_out) => {
             debug!(
                 quote_len = nsm_out.quote.len(),
                 "fresh NSM attestation built"
             );
 
-            // (optional) structured log – comment out if you removed logging helper
-            // crate::logging::log_attestation_summary(&nsm_out.quote, &nonce, &state.spki_der, &state.cert_der, &nsm_out.policy, &nsm_out.runner_version);
-
-            let doc = &nsm_out.doc;
-
-            let cabundle_der_b64 = if doc.cabundle.is_empty() {
-                None
-            } else {
-                Some(doc.cabundle.iter().map(|c| b64(c)).collect())
-            };
-
-            let mut pcrs_hex = BTreeMap::new();
-            for (idx, value) in &doc.pcrs {
-                pcrs_hex.insert(idx.to_string(), hex::encode(value));
-            }
-            let measurement_hex = pcrs_hex.get("0").cloned();
-
-            let user_data_b64 = doc.user_data.as_ref().map(|ud| b64(ud));
-
-            let out = AttestationResponse {
-                attestation: AttestationFields {
-                    quote_b64: b64(&nsm_out.quote),
-                    nonce_b64: b64(&doc.nonce),
-                    spki_der_b64: b64(&doc.public_key),
-                    policy: nsm_out.policy,
-                    runner_version: nsm_out.runner_version,
-                    cabundle_der_b64,
-                    pcrs_hex: if pcrs_hex.is_empty() {
-                        None
-                    } else {
-                        Some(pcrs_hex)
-                    },
-                    measurement_hex,
-                    module_id: Some(doc.module_id.clone()),
-                    digest: Some(doc.digest.clone()),
-                    timestamp_ms: Some(doc.timestamp_ms),
-                    user_data_b64,
-                    attestation_cert_der_b64: Some(b64(&doc.certificate)),
-                },
-                cert_der_b64: b64(&state.cert_der),
-            };
+            let out = attestation_response_from_nsm(&nsm_out, &snapshot.cert_der);
 
             (
                 StatusCode::OK,
@@ -136,4 +133,21 @@ pub async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
     tokio::select! { _ = ctrl_c => {}, _ = terminate => {}, };
+}
+
+/// Returns the RA-TLS attestation bundle associated with the currently active TLS cert.
+pub async fn ratls_staple(
+    maybe_snapshot: Option<Extension<Arc<RaTlsMaterial>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(snapshot) = resolve_snapshot(maybe_snapshot) else {
+        warn!("RA-TLS snapshot missing from request context");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "ratls_context_unavailable" })),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&snapshot.attestation).expect("serialize RA-TLS staple")),
+    )
 }

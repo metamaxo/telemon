@@ -19,17 +19,12 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Handy defaults for local development/tests.
-    pub fn dev() -> anyhow::Result<Self> {
-        Ok(Config {
-            log_level: Some("debug".to_string()),
-            public_addr: def_public_addr(),
-        })
-    }
-
     /// Emit the effective configuration via tracing.
     pub fn info(&self) {
-        tracing::info!(public_addr = %self.public_addr, "effective config");
+        tracing::info!(
+            public_addr = %self.public_addr,
+            "effective config"
+        );
         if self.public_addr.ip().is_unspecified() {
             tracing::warn!("binding to 0.0.0.0 — make sure this is intentional");
         }

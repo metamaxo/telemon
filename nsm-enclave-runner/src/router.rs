@@ -7,20 +7,22 @@ use tower_http::{
 };
 use tracing::Level;
 
-use crate::handlers::*;
-use crate::state::PublicState;
+use crate::handlers::{attestation_handler, health, ratls_staple, ready};
 
-/// Constructs the public HTTP router (health + attestation) with middleware.
-pub fn build_public_router(state: PublicState) -> Router {
+fn base_router() -> Router {
     Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/attestation", post(attestation_handler))
-        .with_state(state)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
         .layer(TimeoutLayer::new(Duration::from_secs(15)))
+}
+
+pub fn build_ratls_router() -> Router {
+    base_router()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/attestation", post(attestation_handler))
+        .route("/.well-known/ratls", get(ratls_staple))
 }

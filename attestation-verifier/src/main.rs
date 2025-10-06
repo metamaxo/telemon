@@ -3,8 +3,13 @@ use base64::Engine;
 use env_logger::Env;
 use nitro_verifier::attestation::{AttnError, Verifier, VerifierConfig};
 use rand::RngCore;
+use reqwest::Url;
 use serde_json::Value as JsonValue;
 use std::{collections::HashMap, env, fs, path::PathBuf, time::Duration};
+
+const DEFAULT_ATTESTATION_HOST: &str = "127.0.0.1";
+const DEFAULT_ATTESTATION_PORT: &str = "8443";
+const DEFAULT_ATTESTATION_PATH: &str = "/attestation";
 
 type CliResult<T> = Result<T, anyhow::Error>;
 
@@ -33,18 +38,20 @@ async fn main() -> CliResult<()> {
 
     let verifier = Verifier::new(cfg)?;
 
-    let (nonce_b64, attestation_json) = fetch_attestation().await?;
+    let (nonce_b64, attestation_json, peer_cert_der) = fetch_attestation().await?;
 
-    match verifier.verify_json(&attestation_json, &nonce_b64) {
+    match verifier.verify_ratls(&peer_cert_der, &attestation_json, &nonce_b64) {
         Ok(result) => {
-            println!("✅ Attestation verified:");
+            let peer_cert_fp = sha256_fingerprint(&peer_cert_der);
+            println!("✅ Attestation + RA-TLS verified:");
             println!("  module_id      : {}", result.module_id);
             println!("  timestamp_ms   : {}", result.timestamp_ms);
             println!("  leaf SHA256    : {}", result.leaf_fingerprint_sha256);
             println!("  root SHA256    : {}", result.root_fingerprint_sha256);
             println!("  root subject   : {}", result.used_root_subject);
             println!("  PCR policy ok  : {}", result.pcrs_ok);
-            println!("  SPKI bound     : {}", result.spki_bound);
+            println!("  RA-TLS bound   : {}", result.spki_bound);
+            println!("  peer cert SHA256 : {peer_cert_fp}");
             Ok(())
         }
         Err(err) => Err(anyhow::anyhow!(format_attn_error(err))),
@@ -112,25 +119,73 @@ fn hex_to_bytes(hex_str: &str) -> CliResult<Vec<u8>> {
 }
 
 /// Generates a nonce, posts it to the local attestation endpoint, and returns both.
-async fn fetch_attestation() -> CliResult<(String, String)> {
+async fn fetch_attestation() -> CliResult<(String, String, Vec<u8>)> {
     let mut nonce = vec![0u8; 32];
     rand::thread_rng().fill_bytes(&mut nonce);
     let nonce_b64 = b64.encode(&nonce);
 
+    let url = resolve_attestation_url()?;
+
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .tls_info(true)
         .timeout(Duration::from_secs(15))
         .build()?;
 
     let response = client
-        .post("https://127.0.0.1:8443/attestation")
+        .post(url)
         .json(&serde_json::json!({ "nonce_b64": nonce_b64 }))
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+
+    let response = response.error_for_status()?;
+
+    let peer_cert = response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .map(|der| der.to_vec())
+        .ok_or_else(|| anyhow::anyhow!("peer certificate missing from TLS response"))?;
 
     let body = response.text().await?;
-    Ok((nonce_b64, body))
+    Ok((nonce_b64, body, peer_cert))
+}
+
+fn resolve_attestation_url() -> CliResult<Url> {
+    if let Ok(url) = env::var("ATTESTATION_URL") {
+        return Url::parse(&url)
+            .map_err(|e| anyhow::anyhow!(format!("parse ATTESTATION_URL: {e}")));
+    }
+
+    let host_raw = env::var("ATTESTATION_HOST").unwrap_or_else(|_| DEFAULT_ATTESTATION_HOST.into());
+    let port = env::var("ATTESTATION_PORT").unwrap_or_else(|_| DEFAULT_ATTESTATION_PORT.into());
+    let path_raw = env::var("ATTESTATION_PATH").unwrap_or_else(|_| DEFAULT_ATTESTATION_PATH.into());
+
+    let host = if host_raw.contains(':') && !host_raw.starts_with('[') {
+        format!("[{host_raw}]")
+    } else {
+        host_raw
+    };
+
+    let path = if path_raw.starts_with('/') {
+        path_raw
+    } else {
+        format!("/{path_raw}")
+    };
+
+    let url = format!("https://{host}:{port}{path}");
+    Url::parse(&url).map_err(|e| anyhow::anyhow!(format!("construct attestation URL: {e}")))
+}
+
+fn sha256_fingerprint(cert_der: &[u8]) -> String {
+    use ring::digest::{digest, SHA256};
+    let digest = digest(&SHA256, cert_der);
+    digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// Human-friendly rendering of `AttnError` variants for CLI output.
@@ -143,6 +198,7 @@ fn format_attn_error(err: AttnError) -> String {
         AttnError::RootUntrusted => "attestation root not trusted".into(),
         AttnError::PcrPolicy(reason) => format!("PCR policy failed: {reason}"),
         AttnError::SpkiBinding => "TLS SPKI binding failed".into(),
+        AttnError::PeerCertificateMismatch => "peer certificate mismatch".into(),
         AttnError::Decode(reason) => format!("decode error: {reason}"),
         AttnError::Internal(reason) => format!("internal error: {reason}"),
     }

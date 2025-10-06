@@ -154,6 +154,29 @@ impl Verifier {
             spki_bound,
         })
     }
+
+    /// Verifies an attestation envelope and ensures it corresponds to the peer certificate.
+    pub fn verify_ratls(
+        &self,
+        peer_cert_der: &[u8],
+        attestation_json: &str,
+        expected_nonce_b64: &str,
+    ) -> Result<VerifiedAttestation, AttnError> {
+        let env: AttestationEnvelope = serde_json::from_str(attestation_json)
+            .map_err(|e| AttnError::Decode(format!("json: {e}")))?;
+        let attn = self.verify_envelope(&env, expected_nonce_b64)?;
+
+        let cert_field = env
+            .cert_der_b64
+            .as_ref()
+            .ok_or_else(|| AttnError::Decode("cert_der_b64 missing".into()))?;
+        let advertised_cert = decode_b64("cert_der_b64", cert_field)?;
+        if !constant_time_eq(peer_cert_der, &advertised_cert) {
+            return Err(AttnError::PeerCertificateMismatch);
+        }
+
+        Ok(attn)
+    }
 }
 
 /// Decodes base64-encoded intermediates from the attestation response, keeping non-self-signed nodes.

@@ -1,14 +1,14 @@
 # nsm-enclave-runner
 
 `nsm-enclave-runner` packages the AWS Nitro Secure Module (NSM) API server into
-an enclave image. It exposes a small HTTPS API listening on `0.0.0.0:8443`
-inside the enclave so verifiers can request fresh attestation documents, read
-platform constraints, and inspect metadata.
+an enclave image. It exposes a single RA-TLS listener on `0.0.0.0:8443` inside
+the enclave so verifiers can request fresh attestation documents, read platform
+constraints, and inspect metadata.
 
 ## Runtime Overview
 
-- Developer-supplied TLS keypair is generated at boot (self-signed); trust is
-  derived from attestation.
+- A fresh RA-TLS keypair is generated at boot and bound into the attestation;
+  certificates rotate automatically on a fixed interval.
 - `/attestation` accepts `{"nonce_b64": "..."}` and responds with:
   - the raw NSM `AttestationDocument` (COSE_Sign1, base64 encoded)
   - the attestation signing certificate and cabundle (base64 DER)

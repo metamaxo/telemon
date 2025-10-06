@@ -19,5 +19,13 @@ async fn main() -> Result<()> {
     logging::setup_logging(&cfg);
     cfg.info();
 
-    Runner::new(cfg).await?.run().await
+    let runner = Runner::builder(cfg)
+        .bind_public()
+        .await?
+        .build_ratls_material()
+        .await?
+        .build()
+        .await?;
+
+    runner.run().await
 }

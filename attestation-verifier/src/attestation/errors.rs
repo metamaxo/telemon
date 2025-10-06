@@ -17,6 +17,8 @@ pub enum AttnError {
     PcrPolicy(String),
     #[error("SPKI binding failed")]
     SpkiBinding,
+    #[error("RA-TLS peer certificate mismatch")]
+    PeerCertificateMismatch,
     #[error("decode error: {0}")]
     Decode(String),
     #[error("internal: {0}")]
